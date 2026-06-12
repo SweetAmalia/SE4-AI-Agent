@@ -50,8 +50,8 @@ from langchain_core.prompts import ChatPromptTemplate
 
 import googlemaps
 
-# .env naast dit script laden, ongeacht vanuit welke map je het start
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+# .env.local naast dit script laden, ongeacht vanuit welke map je het start
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.local"))
 
 # ---------- 0. Config ----------
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -278,10 +278,8 @@ def _safe_jumbo_price(product: Optional[dict]) -> tuple[float, bool]:
         # GraphQL geeft centen als integer; promoPrice gaat voor als die er is
         amount = prices.get("promoPrice") or prices.get("price")
         prijs = round(int(amount) / 100.0, 2)
-        logger.debug(f"Jumbo match '{product.get('title')}' → €{prijs:.2f}")
         return prijs, prijs > 0
     except (KeyError, TypeError, ValueError) as e:
-        logger.debug(f"Jumbo price parse mislukt: {e} | raw: {product}")
         return 0.0, False
 
 
@@ -485,8 +483,10 @@ def node_vergelijk_prijzen(state: AgentState) -> AgentState:
             "jumbo_beschikbaar": jumbo_ok,
             "jumbo_match": (jumbo_product or {}).get("title"),
         })
-        logger.debug(f"{item.label()}: AH €{ah_prijs:.2f} ({'✓' if ah_ok else '✗'}) | "
-                     f"Jumbo €{jumbo_prijs:.2f} ({'✓' if jumbo_ok else '✗'})")
+        ah_match_title = (ah_product or {}).get("title", "geen match")
+        jumbo_match_title = (jumbo_product or {}).get("title", "geen match")
+        logger.debug(f"{item.label()}: AH €{ah_prijs:.2f} ({'✓' if ah_ok else '✗'}) → {ah_match_title}")
+        logger.debug(f"{item.label()}: Jumbo €{jumbo_prijs:.2f} ({'✓' if jumbo_ok else '✗'}) → {jumbo_match_title}")
 
     return {"prijs_data": {
         "ah_totaal": round(ah_totaal, 2),
