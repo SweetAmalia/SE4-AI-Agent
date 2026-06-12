@@ -59,6 +59,10 @@ LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "local-model")
 GMAPS_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 KETENS = ["Albert Heijn", "Jumbo", "Lidl", "Hoogvliet"]
 
+# True  → kies de goedkoopste geldige match uit de zoekresultaten
+# False → kies de beste titelovereenkomst (origineel gedrag)
+KIES_GOEDKOOPSTE = True
+
 gmaps = googlemaps.Client(key=GMAPS_KEY) if GMAPS_KEY else None
 
 
@@ -210,6 +214,18 @@ _STOPWOORDEN = {
     "g", "kg", "ml", "l", "st", "x", "ca", "per",
 }
 
+# Multipack-patronen: "2x 12-pack", "12-pack", "4x250ml", "7+1", "24x", "multipack", "tray"
+# Query noemt nooit een verpakkingsgrootte → zware penalty als titel er wél een heeft.
+_MULTIPACK_RE = re.compile(
+    r"\b\d+[\s\-]?pack\b"          # 12-pack, 4 pack, 24pack
+    r"|\bmultipack\b"
+    r"|\btray\b"
+    r"|\b\d+\s*\+\s*\d+\b"         # 7+1, 5 + 1 (bonusverpakking)
+    r"|\b(?:[2-9]|\d{2,})\s*x(?!\w)"   # 2x, 24x, 15 x (maar niet "1x" of "extra")
+    r"|\b(?:[2-9]|\d{2,})\s*x\d",      # 4x250ml (x direct gevolgd door cijfer)
+    re.IGNORECASE,
+)
+
 
 def _woord_match(query_woord: str, titel_woord: str) -> bool:
     """Geeft True als twee woorden als hetzelfde product-woord beschouwd worden.
@@ -230,23 +246,25 @@ def _woord_match(query_woord: str, titel_woord: str) -> bool:
     return False
 
 
-def _beste_match(producten: list[dict], query: str) -> Optional[dict]:
+def _beste_match(producten: list[dict], query: str, prijs_fn=None) -> Optional[dict]:
     """Kies het best passende product.
 
     Scoring per product:
-      +1 per query-woord dat als heel woord in de titel voorkomt
+      +1  per query-woord dat als heel woord in de titel voorkomt
       -0.2 per titel-woord dat niet overeenkomt met een query-woord (ruis)
-
-    Dit voorkomt dat "pinda" scoort op "pindakaas" (substring), en geeft
-    voorkeur aan titels die dicht bij de zoekopdracht blijven.
+      -5  als de titel een multipack-indicator bevat (bijv. "2x 12-pack")
+          en de query dat niet doet — voorkomt dat "13x Red Bull" een
+          24-blikjes-pack pakt in plaats van een los blikje.
     """
     if not producten:
         return None
 
     query_woorden = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 1]
+    query_heeft_multipack = bool(_MULTIPACK_RE.search(query))
 
     def score(p: dict) -> float:
-        titel_woorden = re.findall(r"\w+", (p.get("title") or "").lower())
+        titel = (p.get("title") or "")
+        titel_woorden = re.findall(r"\w+", titel.lower())
 
         hits = sum(
             1 for qw in query_woorden
@@ -258,13 +276,42 @@ def _beste_match(producten: list[dict], query: str) -> Optional[dict]:
             and len(tw) > 2
             and not any(_woord_match(qw, tw) for qw in query_woorden)
         )
-        return hits - ruis * 0.2
+        multipack_penalty = (
+            0 if query_heeft_multipack
+            else (-5 if _MULTIPACK_RE.search(titel) else 0)
+        )
+        return hits - ruis * 0.2 + multipack_penalty
 
     sco = [(score(p), i, p) for i, p in enumerate(producten)]
     sco.sort(key=lambda x: (x[0], -x[1]), reverse=True)
-    best_score, _, best = sco[0]
+    best_score = sco[0][0]
 
-    return best if best_score > 0 else producten[0]
+    if best_score <= 0:
+        # Geen enkel product matcht goed; pak dan het minst slechte
+        # (sco is gesorteerd, dus multipack-penalties tellen nog steeds mee)
+        return sco[0][2]
+
+    kandidaten = [p for s, _, p in sco if s > 0]
+
+    if KIES_GOEDKOOPSTE and prijs_fn is not None:
+        return min(kandidaten, key=lambda p: prijs_fn(p) or float("inf"))
+    return kandidaten[0]
+
+
+def _ah_prijs(p: dict) -> float:
+    try:
+        return float(p.get("currentPrice") or p.get("priceBeforeBonus") or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _jumbo_prijs(p: dict) -> float:
+    try:
+        prices = p["prices"]
+        amount = prices.get("promoPrice") or prices.get("price")
+        return int(amount) / 100.0
+    except (KeyError, TypeError, ValueError):
+        return float("inf")
 
 
 @retry(
@@ -275,7 +322,8 @@ def _beste_match(producten: list[dict], query: str) -> Optional[dict]:
 )
 def _ah_search(query: str) -> Optional[dict]:
     producten = ah.search_products(query=query, size=5, page=0)
-    return _beste_match(producten, query)
+    logger.debug(f"AH API '{query}' → {len(producten)} resultaten: {[p.get('title') for p in producten]}")
+    return _beste_match(producten, query, prijs_fn=_ah_prijs)
 
 
 @retry(
@@ -300,7 +348,8 @@ def _jumbo_search(query: str) -> Optional[dict]:
     res.raise_for_status()
     try:
         producten = res.json()["data"]["searchProducts"]["products"]
-        return _beste_match(producten[:10], query)
+        logger.debug(f"Jumbo API '{query}' → {len(producten)} resultaten: {[p.get('title') for p in producten[:10]]}")
+        return _beste_match(producten[:10], query, prijs_fn=_jumbo_prijs)
     except (KeyError, IndexError, TypeError):
         return None
 
@@ -388,7 +437,7 @@ def node_parse_input(state: AgentState) -> AgentState:
          "- Telbare producten (bananen, broden, blikjes): eenheid=stuks, aantal=hoeveel stuks\n"
          "- Gewicht/volume (500 gram gehakt, 1.5 liter melk): aantal=hoeveelheid, eenheid=gewichtseenheid\n"
          "- Verwijder ALLEEN verpakkings- en containerwoorden uit de naam: "
-         "'pak', 'pakje', 'fles', 'blik', 'pot', 'zak', 'tros', 'bakje', 'netje', 'doos', 'bos', 'rol'\n"
+         "'pak', 'pakje', 'fles', 'blik', 'blikje', 'pot', 'zak', 'tros', 'bakje', 'netje', 'doos', 'bos', 'rol', 'flesje', 'potje'\n"
          "- Behoud ALTIJD beschrijvende woorden zoals: vegetarisch, biologisch, mager, halfvol, "
          "volkoren, light, naturel, gerookt, vers, diepvries, zout, ongezouten, wit, bruin, "
          "of andere eigenschappen die het product beschrijven\n"
@@ -641,7 +690,41 @@ def vraag(tekst: str) -> None:
     print(f"\n{result.get('advies')}\n")
 
 
+def test_goedkoopste():
+    """Test KIES_GOEDKOOPSTE op een paar representatieve gevallen."""
+    print("\n=== TEST: _beste_match met KIES_GOEDKOOPSTE ===\n")
+
+    ah_mock = [
+        {"title": "Red Bull Energy Drink 250 ml",         "currentPrice": 1.49},
+        {"title": "Red Bull Energy Drink 4-pack 4x250ml", "currentPrice": 4.79},
+        {"title": "Red Bull The Tropical Edition 250 ml", "currentPrice": 1.59},
+    ]
+    jumbo_mock = [
+        {"title": "Red Bull Energy Drink 250 ml",   "prices": {"price": 159, "promoPrice": None}},
+        {"title": "Red Bull Tropical 250 ml",        "prices": {"price": 149, "promoPrice": None}},
+        {"title": "Red Bull 24x 250 ml multipack",   "prices": {"price": 2999, "promoPrice": None}},
+    ]
+
+    cases = [
+        ("Red Bull Tropical", ah_mock, _ah_prijs),
+        ("Red Bull Tropical", jumbo_mock, _jumbo_prijs),
+        ("Red Bull",          ah_mock,   _ah_prijs),
+    ]
+
+    for query, producten, prijs_fn in cases:
+        resultaat = _beste_match(producten, query, prijs_fn=prijs_fn)
+        titel = (resultaat or {}).get("title", "geen match")
+        print(f"  query='{query}' → '{titel}'")
+
+    print()
+
+
 if __name__ == "__main__":
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == "test":
+        test_goedkoopste()
+        _sys.exit(0)
+
     print("=== Supermarkt Vergelijker v5 (T3) ===")
     print(f"LM Studio: {LM_STUDIO_BASE_URL} ({LM_STUDIO_MODEL})")
     print(f"Google Maps: {'✓' if gmaps else '✗ (geen key)'}")
