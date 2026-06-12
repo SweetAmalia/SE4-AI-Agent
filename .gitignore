@@ -212,3 +212,6 @@ __marimo__/
 *.db
 *.xlsx
 *.xls
+
+# ChromaDB vector database (lokaal gegenereerd via build_index.py)
+testScript/chroma_db/
