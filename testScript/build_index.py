@@ -51,6 +51,8 @@ SEED_TERMEN = [
     # soepen, conserven & voorraad
     "soep", "tomatensoep", "kippensoep", "bouillonblokjes", "mais",
     "kidneybonen", "kikkererwten", "linzen", "appelmoes", "olijven",
+    "hummus", "tzatziki", "guacamole", "taramosalata", "baba ganoush",
+    "pesto", "tapenade", "roomkaas", "boursin", "aioli",
     # ontbijt & tussendoor
     "muesli", "cornflakes", "havermout", "ontbijtkoek", "mueslireep",
     "chips", "nootjes", "pinda", "studentenhaver", "chocolade", "koekjes",
