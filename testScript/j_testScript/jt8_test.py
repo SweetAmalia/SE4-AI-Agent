@@ -33,7 +33,8 @@ Eerst draaien:
 
 from __future__ import annotations
 
-import json
+import json, re
+from json import JSONDecodeError
 import math
 import os
 import re
@@ -66,7 +67,7 @@ import googlemaps
 from winkel_clients import AHClient, jumbo_search_products, ah_prijs, jumbo_prijs, lidl_search_products, lidl_prijs
 from vector_store import zoek_producten
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.local"))
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.env.local"))
 
 # ---------- 0. Config ----------
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -445,6 +446,61 @@ def _dichtstbijzijnde_filiaal(keten: str, lat: float, lon: float) -> Optional[di
 
 
 # ---------- 4. Nodes ----------
+
+def _extract_balanced_json(text: str) -> str | None:
+    """Vindt het eerste { ... } blok met gebalanceerde accolades.
+    Robuster dan r'\\{.*\\}' bij afgekapte/rommelige LLM output."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None  # niet gebalanceerd → afgekapt
+
+
+def _parse_llm_json(raw: str) -> dict:
+    """Probeert in drie lagen: strict → balanced → repair."""
+    # 1) direct
+    try:
+        return json.loads(raw)
+    except JSONDecodeError:
+        pass
+    # 2) balanced extract
+    candidate = _extract_balanced_json(raw)
+    if candidate:
+        try:
+            return json.loads(candidate)
+        except JSONDecodeError:
+            raw = candidate  # geef aan de repair-stap mee
+    # 3) json-repair als laatste redmiddel
+    if repair_json is not None:
+        try:
+            fixed = repair_json(raw)
+            return json.loads(fixed)
+        except Exception as e:
+            raise ValueError(f"json-repair faalde: {e}") from e
+    raise ValueError("Kon geen valide JSON uit LLM-output halen")
+
+
 def node_parse_input(state: AgentState) -> AgentState:
     logger.info("Node 1 — intent extractie")
     text = state.get("user_input", "")
@@ -453,39 +509,50 @@ def node_parse_input(state: AgentState) -> AgentState:
         ("system",
          "Jij bent een strenge data-extractor voor een supermarkt-API. "
          "Geef ALLEEN een geldig JSON-object terug, zonder uitleg of markdown. "
-         "Maak het JSON-object af, ook bij lange lijsten.\n\n"
+         "Gebruik dubbele quotes. Maak het JSON-object altijd af.\n\n"
          "Formaat: {{\"locatie\": \"stad of null\", \"items\": [{{\"naam\": \"productnaam\", \"aantal\": 1, \"eenheid\": \"stuks\"}}]}}\n\n"
          "Regels:\n"
          "- 'eenheid' is een van: stuks, gram, kg, ml, liter\n"
-         "- Telbare producten (bananen, broden, blikjes): eenheid=stuks, aantal=hoeveel stuks\n"
-         "- Gewicht/volume (500 gram gehakt, 1.5 liter melk): aantal=hoeveelheid, eenheid=gewichtseenheid\n"
-         "- Verwijder ALLEEN verpakkings- en containerwoorden uit de naam: "
-         "'pak', 'pakje', 'fles', 'blik', 'blikje', 'pot', 'zak', 'tros', 'bakje', 'netje', 'doos', 'bos', 'rol', 'flesje', 'potje'\n"
-         "- Behoud ALTIJD beschrijvende woorden zoals: vegetarisch, biologisch, mager, halfvol, "
-         "volkoren, light, naturel, gerookt, vers, diepvries, zout, ongezouten, wit, bruin, "
-         "of andere eigenschappen die het product beschrijven\n"
-         "- Schrijf productnamen in enkelvoud TENZIJ het merk of product altijd meervoud gebruikt\n"
-         "- locatie is null als er geen plaatsnaam wordt genoemd\n\n"
-         "Voorbeeld input: \"13 bananen, 500 gram gehakt, 6 redbull en een zak vegetarische balletjes in Delft\"\n"
-         "Voorbeeld output: {{\"locatie\": \"Delft\", \"items\": ["
-         "{{\"naam\": \"banaan\", \"aantal\": 13, \"eenheid\": \"stuks\"}}, "
-         "{{\"naam\": \"gehakt\", \"aantal\": 500, \"eenheid\": \"gram\"}}, "
-         "{{\"naam\": \"Red Bull\", \"aantal\": 6, \"eenheid\": \"stuks\"}}, "
-         "{{\"naam\": \"vegetarische balletjes\", \"aantal\": 1, \"eenheid\": \"stuks\"}}]}}"),
+         "- Telbare producten (bananen, broden, blikjes): eenheid=stuks\n"
+         "- Gewicht/volume: aantal=hoeveelheid, eenheid=gewichtseenheid\n"
+         "- Verwijder verpakkingswoorden: pak, pakje, fles, blik, blikje, pot, zak, tros, bakje, netje, doos, bos, rol\n"
+         "- Behoud beschrijvende woorden (vegetarisch, biologisch, mager, halfvol, etc.)\n"
+         "- locatie = null als er geen plaatsnaam genoemd is (NIET een lege string).\n\n"
+         "Voorbeeld input: \"24 blikjes redbull\"\n"
+         "Voorbeeld output: {{\"locatie\": null, \"items\": ["
+         "{{\"naam\": \"Red Bull\", \"aantal\": 24, \"eenheid\": \"stuks\"}}]}}"),
         ("user", "{input}"),
     ])
 
-    try:
-        response = (prompt | llm).invoke({"input": text})
+    # Standaard reset-payload: zorgt dat oude geocode/winkels van vorige turn
+    # NIET blijven hangen.  Dit fixt bug 1.
+    reset = {
+        "geocode": None,
+        "winkels": None,
+        "prijs_data": None,
+        "advies": None,
+        "zoek_queries": {},
+        "match_poging": 0,
+    }
+
+    def _try_extract(user_text: str) -> dict:
+        response = (prompt | llm).invoke({"input": user_text})
         raw = response.content.strip()
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            raise ValueError(
-                f"Geen volledige JSON in LLM-output (mogelijk afgekapt). "
-                f"Laatste 120 tekens: ...{raw[-120:]!r}"
-            )
-        data = json.loads(json_match.group(0))
+        return _parse_llm_json(raw)
+
+    try:
+        try:
+            data = _try_extract(text)
+        except (JSONDecodeError, ValueError) as first_err:
+            logger.warning(f"LLM JSON-parse faalde, 1x retry: {first_err}")
+            # Retry met een licht aangescherpte hint
+            data = _try_extract(text + "\n\n# Geef alleen geldig, compleet JSON terug.")
+
         resultaat = ExtractieResultaat(**data)
+
+        # Normaliseer lege string -> None  (helpt node_locatie)
+        if isinstance(resultaat.locatie, str) and not resultaat.locatie.strip():
+            resultaat.locatie = None
 
         print("\n📋 Dit heb ik begrepen:")
         for item in resultaat.items:
@@ -494,15 +561,87 @@ def node_parse_input(state: AgentState) -> AgentState:
             print(f"   📍 Locatie genoemd: {resultaat.locatie}")
         print()
 
-        logger.success(f"Extractie OK: locatie={resultaat.locatie}, items={[i.label() for i in resultaat.items]}")
-        # Feedbackloop-teller resetten bij een nieuwe vraag
-        return {"extractie": resultaat.model_dump(), "zoek_queries": {}, "match_poging": 0}
-    except Exception as e:
-        logger.error(f"LLM parsing faalde: {e}")
-        return {"extractie": {"locatie": None, "items": []}, "zoek_queries": {}, "match_poging": 0}
+        logger.success(
+            f"Extractie OK: locatie={resultaat.locatie}, "
+            f"items={[i.label() for i in resultaat.items]}"
+        )
+        return {"extractie": resultaat.model_dump(), **reset}
 
+    except Exception as e:
+        logger.error(f"LLM parsing faalde definitief: {e}")
+        return {"extractie": {"locatie": None, "items": []}, **reset}
+
+# def node_parse_input(state: AgentState) -> AgentState:
+#     logger.info("Node 1 — intent extractie")
+#     text = state.get("user_input", "")
+
+#     prompt = ChatPromptTemplate.from_messages([
+#         ("system",
+#          "Jij bent een strenge data-extractor voor een supermarkt-API. "
+#          "Geef ALLEEN een geldig JSON-object terug, zonder uitleg of markdown. "
+#          "Maak het JSON-object af, ook bij lange lijsten.\n\n"
+#          "Formaat: {{\"locatie\": \"stad of null\", \"items\": [{{\"naam\": \"productnaam\", \"aantal\": 1, \"eenheid\": \"stuks\"}}]}}\n\n"
+#          "Regels:\n"
+#          "- 'eenheid' is een van: stuks, gram, kg, ml, liter\n"
+#          "- Telbare producten (bananen, broden, blikjes): eenheid=stuks, aantal=hoeveel stuks\n"
+#          "- Gewicht/volume (500 gram gehakt, 1.5 liter melk): aantal=hoeveelheid, eenheid=gewichtseenheid\n"
+#          "- Verwijder ALLEEN verpakkings- en containerwoorden uit de naam: "
+#          "'pak', 'pakje', 'fles', 'blik', 'blikje', 'pot', 'zak', 'tros', 'bakje', 'netje', 'doos', 'bos', 'rol', 'flesje', 'potje'\n"
+#          "- Behoud ALTIJD beschrijvende woorden zoals: vegetarisch, biologisch, mager, halfvol, "
+#          "volkoren, light, naturel, gerookt, vers, diepvries, zout, ongezouten, wit, bruin, "
+#          "of andere eigenschappen die het product beschrijven\n"
+#          "- Schrijf productnamen in enkelvoud TENZIJ het merk of product altijd meervoud gebruikt\n"
+#          "- locatie is null als er geen plaatsnaam wordt genoemd\n\n"
+#          "Voorbeeld input: \"13 bananen, 500 gram gehakt, 6 redbull en een zak vegetarische balletjes in Delft\"\n"
+#          "Voorbeeld output: {{\"locatie\": \"Delft\", \"items\": ["
+#          "{{\"naam\": \"banaan\", \"aantal\": 13, \"eenheid\": \"stuks\"}}, "
+#          "{{\"naam\": \"gehakt\", \"aantal\": 500, \"eenheid\": \"gram\"}}, "
+#          "{{\"naam\": \"Red Bull\", \"aantal\": 6, \"eenheid\": \"stuks\"}}, "
+#          "{{\"naam\": \"vegetarische balletjes\", \"aantal\": 1, \"eenheid\": \"stuks\"}}]}}"),
+#         ("user", "{input}"),
+#     ])
+
+#     try:
+#         response = (prompt | llm).invoke({"input": text})
+#         raw = response.content.strip()
+#         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+#         if not json_match:
+#             raise ValueError(
+#                 f"Geen volledige JSON in LLM-output (mogelijk afgekapt). "
+#                 f"Laatste 120 tekens: ...{raw[-120:]!r}"
+#             )
+#         data = json.loads(json_match.group(0))
+#         resultaat = ExtractieResultaat(**data)
+
+#         print("\n📋 Dit heb ik begrepen:")
+#         for item in resultaat.items:
+#             print(f"   • {item.label()}")
+#         if resultaat.locatie:
+#             print(f"   📍 Locatie genoemd: {resultaat.locatie}")
+#         print()
+
+#         logger.success(f"Extractie OK: locatie={resultaat.locatie}, items={[i.label() for i in resultaat.items]}")
+#         # Feedbackloop-teller resetten bij een nieuwe vraag
+#         return {
+#             "extractie": resultaat.model_dump(),
+#             "zoek_queries": {},
+#             "match_poging": 0,
+#             # geen oude locaties en adviezen meenemen in een volgende run. (verander voor deployment)
+#             "geocode": None,
+#             "winkels": None,
+#             "prijs_data": None,
+#             "advies": None,
+#         }
+#     except Exception as e:
+#         logger.error(f"LLM parsing faalde: {e}")
+#         return {"extractie": {"locatie": None, "items": []}, "zoek_queries": {}, "match_poging": 0}
 
 def node_locatie(state: AgentState) -> AgentState:
+    # if locatie == lege string > set None
+    locatie = state["extractie"].get("locatie")
+    if isinstance(locatie, str) and not locatie.strip():
+        locatie = None
+
     """Locatie uit tekst geocoderen, anders automatisch bepalen via Geolocation API."""
     if not gmaps:
         logger.warning("Geen GOOGLE_MAPS_API_KEY — locatiebepaling overgeslagen")
