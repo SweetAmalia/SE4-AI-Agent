@@ -211,3 +211,6 @@ __marimo__/
 *.db
 *.xlsx
 *.xls
+
+testScript/chroma_db/
+testScript/j_testScript/jchroma_db
