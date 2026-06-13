@@ -214,3 +214,4 @@ __marimo__/
 
 testScript/chroma_db/
 testScript/j_testScript/jchroma_db
+testScript/.env.local
