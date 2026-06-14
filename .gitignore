@@ -214,5 +214,6 @@ __marimo__/
 *.xlsx
 *.xls
 
-# ChromaDB vector database (lokaal gegenereerd via build_index.py)
 testScript/chroma_db/
+testScript/j_testScript/jchroma_db
+testScript/.env.local
