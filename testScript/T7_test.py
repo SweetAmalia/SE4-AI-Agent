@@ -342,7 +342,7 @@ def _live_fallback(query: str, winkel: str) -> Optional[dict]:
         ruwe = jumbo_search_products(query)[:10]
         prijs_fn = jumbo_prijs
 
-    logger.debug(f"Live fallback '{query}' @ {winkel} → {[p.get('title') for p in ruwe[:5]]}")
+
 
     query_heeft_multipack = bool(_MULTIPACK_RE.search(query))
     kandidaten = [
